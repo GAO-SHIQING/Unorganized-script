@@ -1,0 +1,14 @@
+{
+  "workflow": "/home/qc/GAOSHIQING/ComfyUI/script/workflow_api/Qwen_2512.json",
+  "output_dir": "/home/qc/GAOSHIQING/ComfyUI/output/qwen_2512_api",
+  "overrides": [
+    "108.text=一只穿宇航服的猴，电影级光影，超细节，8k",
+    "106.seed=123456789",
+    "106.steps=8",
+    "106.cfg=2",
+    "107.width=1664",
+    "107.height=928"
+  ],
+  "server": "http://127.0.0.1:8888",
+  "progress_callback_url": "http://127.0.0.1:9000/api/comfy/progress"
+}
