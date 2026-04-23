@@ -37,6 +37,11 @@ DUAL_GPU_B="1"
 OLLAMA_DIR="${OLLAMA_DIR:-/home/qc/GAOSHIQING/ollama}"
 OLLAMA_API_URL="${OLLAMA_API_URL:-http://127.0.0.1:11434/api/tags}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+SUMMARY_RETENTION_DAYS="${SUMMARY_RETENTION_DAYS:-7}"
+RUN_SUMMARY_LINES=()
+RUN_SUMMARY_MODE=""
+RUN_SUMMARY_TS_FILE=""
+RUN_SUMMARY_TS_HUMAN=""
 
 normalize_gpu_choice() {
     case "$1" in
@@ -418,6 +423,114 @@ run_comfy() {
     fi
 }
 
+device_label_from_choice() {
+    case "$1" in
+        3) echo "CPU" ;;
+        2) echo "ALL_GPU" ;;
+        *) echo "GPU $1" ;;
+    esac
+}
+
+print_custom_instance_lines() {
+    local prefix="$1"
+    for idx in "${!INSTANCE_PORTS[@]}"; do
+        local label
+        label="$(device_label_from_choice "${INSTANCE_GPUS[$idx]}")"
+        echo "$prefix 端口 ${INSTANCE_PORTS[$idx]} -> ${label}"
+    done
+}
+
+start_instance_bg() {
+    local port="$1"
+    local gpu="$2"
+    local log_file="$3"
+    local index_label="$4"
+
+    if [ "$gpu" = "3" ]; then
+        echo "启动实例 ${index_label}: 端口 $port, CPU"
+        unset CUDA_VISIBLE_DEVICES
+        run_comfy --cpu --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+    elif [ "$gpu" = "2" ]; then
+        echo "启动实例 ${index_label}: 端口 $port, 所有 GPU"
+        unset CUDA_VISIBLE_DEVICES
+        run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+    else
+        echo "启动实例 ${index_label}: 端口 $port, GPU $gpu"
+        CUDA_VISIBLE_DEVICES="$gpu" run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+    fi
+    echo "日志: $log_file"
+}
+
+append_run_summary_line() {
+    local port="$1"
+    local gpu="$2"
+    local log_file="$3"
+    local label
+    label="$(device_label_from_choice "$gpu")"
+    RUN_SUMMARY_LINES+=("端口 ${port} -> ${label} | 日志: ${log_file}")
+}
+
+write_run_summary_file() {
+    local summary_dir="$COMFY_DIR/logs/run_summaries"
+    local summary_file="$summary_dir/run_summary_${RUN_SUMMARY_TS_FILE}.txt"
+    local line
+
+    mkdir -p "$summary_dir"
+    find "$summary_dir" -type f -name "run_summary_*.txt" -mtime +"$SUMMARY_RETENTION_DAYS" -delete 2>/dev/null
+
+    {
+        echo "ComfyUI 启动摘要"
+        echo "时间: $RUN_SUMMARY_TS_HUMAN"
+        echo "模式: $RUN_SUMMARY_MODE"
+        echo "监听地址: $LISTEN_ADDR"
+        echo "摘要保留天数: $SUMMARY_RETENTION_DAYS"
+        echo "----------------------------------------"
+        for line in "${RUN_SUMMARY_LINES[@]}"; do
+            echo "$line"
+        done
+    } > "$summary_file"
+
+    echo "启动摘要: $summary_file"
+}
+
+start_two_instance_mode() {
+    local mode="$1"
+    local gpu_a="$2"
+    local gpu_b="$3"
+    local port1="$BASE_PORT"
+    local port2=$((BASE_PORT+1))
+    local ts
+    local log1
+    local log2
+
+    ts="$(date +%Y%m%d_%H%M%S)"
+    log1="$COMFY_DIR/logs/comfyui_${port1}_${ts}.log"
+    log2="$COMFY_DIR/logs/comfyui_${port2}_${ts}.log"
+
+    echo "启动实例 A: 端口 $port1, GPU $gpu_a"
+    CUDA_VISIBLE_DEVICES="$gpu_a" run_comfy --listen "$LISTEN_ADDR" --port "$port1" > "$log1" 2>&1 &
+    echo "启动实例 B: 端口 $port2, GPU $gpu_b"
+    CUDA_VISIBLE_DEVICES="$gpu_b" run_comfy --listen "$LISTEN_ADDR" --port "$port2" > "$log2" 2>&1 &
+    echo ""
+
+    if [ "$mode" = "dual" ]; then
+        echo "双卡模式服务已启动，请保持此窗口打开。"
+        echo "实例 A: http://$LISTEN_ADDR:$port1 (GPU $gpu_a)"
+        echo "实例 B: http://$LISTEN_ADDR:$port2 (GPU $gpu_b)"
+    else
+        echo "服务已启动，请保持此窗口打开。"
+        echo "实例 A: http://$LISTEN_ADDR:$port1"
+        echo "实例 B: http://$LISTEN_ADDR:$port2"
+    fi
+    echo "日志 A: $log1"
+    echo "日志 B: $log2"
+    echo "实时日志: tail -f \"$log1\" \"$log2\""
+    append_run_summary_line "$port1" "$gpu_a" "$log1"
+    append_run_summary_line "$port2" "$gpu_b" "$log2"
+    write_run_summary_file
+    wait
+}
+
 if [ ! -d "$COMFY_DIR" ]; then
     echo "ERROR: 找不到目录 $COMFY_DIR"
     exit 1
@@ -565,6 +678,8 @@ cleanup() {
     exit
 }
 trap cleanup SIGINT SIGTERM
+RUN_SUMMARY_TS_FILE="$(date +%Y%m%d_%H%M%S)"
+RUN_SUMMARY_TS_HUMAN="$(date '+%Y-%m-%d %H:%M:%S')"
 
 echo ""
 echo "================ 启动信息 ================"
@@ -572,15 +687,8 @@ echo "目录: $COMFY_DIR"
 if [ "$RUN_MODE" = "custom" ]; then
     echo "模式: 自定义多端口"
     for idx in "${!INSTANCE_PORTS[@]}"; do
-        device_label="${INSTANCE_GPUS[$idx]}"
-        if [ "$device_label" = "3" ]; then
-            device_label="CPU"
-        elif [ "$device_label" = "2" ]; then
-            device_label="ALL_GPU"
-        else
-            device_label="GPU ${device_label}"
-        fi
-        echo "实例 $((idx+1)): http://$LISTEN_ADDR:${INSTANCE_PORTS[$idx]} -> ${device_label}"
+        label="$(device_label_from_choice "${INSTANCE_GPUS[$idx]}")"
+        echo "实例 $((idx+1)): http://$LISTEN_ADDR:${INSTANCE_PORTS[$idx]} -> ${label}"
     done
 elif [ "$USE_CPU" = "1" ]; then
     echo "设备: CPU"
@@ -605,17 +713,7 @@ if [ -t 0 ]; then
     echo ""
     echo "请确认将要启动的实例："
     if [ "$RUN_MODE" = "custom" ]; then
-        for idx in "${!INSTANCE_PORTS[@]}"; do
-            device_label="${INSTANCE_GPUS[$idx]}"
-            if [ "$device_label" = "3" ]; then
-                device_label="CPU"
-            elif [ "$device_label" = "2" ]; then
-                device_label="ALL_GPU"
-            else
-                device_label="GPU ${device_label}"
-            fi
-            echo " - 端口 ${INSTANCE_PORTS[$idx]} -> ${device_label}"
-        done
+        print_custom_instance_lines " -"
     elif [ "$RUN_MODE" = "turbo" ]; then
         echo " - 端口 $BASE_PORT -> GPU $TURBO_GPU_A"
         echo " - 端口 $((BASE_PORT+1)) -> GPU $TURBO_GPU_B"
@@ -629,7 +727,8 @@ if [ -t 0 ]; then
     else
         echo " - 端口 $BASE_PORT -> GPU $GPU_CHOICE"
     fi
-    read -p "确认启动以上实例? (y/N): " start_confirm
+    read -p "确认启动以上实例? (Y/n) [默认 Y]: " start_confirm
+    [ -z "$start_confirm" ] && start_confirm="y"
     if [ "$start_confirm" != "y" ] && [ "$start_confirm" != "Y" ]; then
         echo "已取消启动。"
         exit 0
@@ -637,78 +736,53 @@ if [ -t 0 ]; then
 fi
 
 if [ "$RUN_MODE" == "custom" ]; then
+    RUN_SUMMARY_MODE="custom"
     TS="$(date +%Y%m%d_%H%M%S)"
+    CUSTOM_LOG_FILES=()
     echo "按自定义布局启动实例..."
     for idx in "${!INSTANCE_PORTS[@]}"; do
         port="${INSTANCE_PORTS[$idx]}"
         gpu="${INSTANCE_GPUS[$idx]}"
         log_file="$COMFY_DIR/logs/comfyui_${port}_${TS}.log"
-        if [ "$gpu" = "3" ]; then
-            echo "启动实例 $((idx+1)): 端口 $port, CPU"
-            unset CUDA_VISIBLE_DEVICES
-            run_comfy --cpu --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
-        elif [ "$gpu" = "2" ]; then
-            echo "启动实例 $((idx+1)): 端口 $port, 所有 GPU"
-            unset CUDA_VISIBLE_DEVICES
-            run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
-        else
-            echo "启动实例 $((idx+1)): 端口 $port, GPU $gpu"
-            CUDA_VISIBLE_DEVICES="$gpu" run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
-        fi
-        echo "日志: $log_file"
+        start_instance_bg "$port" "$gpu" "$log_file" "$((idx+1))"
+        append_run_summary_line "$port" "$gpu" "$log_file"
+        CUSTOM_LOG_FILES+=("$log_file")
     done
     echo ""
     echo "服务已启动，请保持此窗口打开。"
-    echo "实时日志: tail -f \"$COMFY_DIR\"/logs/comfyui_*.log"
+    for idx in "${!INSTANCE_PORTS[@]}"; do
+        echo "端口 ${INSTANCE_PORTS[$idx]} 实时日志: tail -f \"${CUSTOM_LOG_FILES[$idx]}\""
+    done
+    all_logs_cmd="tail -f"
+    for f in "${CUSTOM_LOG_FILES[@]}"; do
+        all_logs_cmd="$all_logs_cmd \"$f\""
+    done
+    echo "全部实例实时日志: $all_logs_cmd"
+    write_run_summary_file
     wait
 elif [ "$RUN_MODE" == "turbo" ]; then
-    PORT1=$BASE_PORT
-    PORT2=$((BASE_PORT+1))
-    TS="$(date +%Y%m%d_%H%M%S)"
-    LOG1="$COMFY_DIR/logs/comfyui_${PORT1}_${TS}.log"
-    LOG2="$COMFY_DIR/logs/comfyui_${PORT2}_${TS}.log"
-
-    echo "启动实例 A: 端口 $PORT1, GPU $TURBO_GPU_A"
-    CUDA_VISIBLE_DEVICES="$TURBO_GPU_A" run_comfy --listen "$LISTEN_ADDR" --port "$PORT1" > "$LOG1" 2>&1 &
-    echo "启动实例 B: 端口 $PORT2, GPU $TURBO_GPU_B"
-    CUDA_VISIBLE_DEVICES="$TURBO_GPU_B" run_comfy --listen "$LISTEN_ADDR" --port "$PORT2" > "$LOG2" 2>&1 &
-    echo ""
-    echo "服务已启动，请保持此窗口打开。"
-    echo "实例 A: http://$LISTEN_ADDR:$PORT1"
-    echo "实例 B: http://$LISTEN_ADDR:$PORT2"
-    echo "日志 A: $LOG1"
-    echo "日志 B: $LOG2"
-    echo "实时日志: tail -f \"$LOG1\" \"$LOG2\""
-    wait
+    RUN_SUMMARY_MODE="turbo"
+    start_two_instance_mode "turbo" "$TURBO_GPU_A" "$TURBO_GPU_B"
 elif [ "$RUN_MODE" == "dual" ]; then
-    PORT1=$BASE_PORT
-    PORT2=$((BASE_PORT+1))
-    TS="$(date +%Y%m%d_%H%M%S)"
-    LOG1="$COMFY_DIR/logs/comfyui_${PORT1}_${TS}.log"
-    LOG2="$COMFY_DIR/logs/comfyui_${PORT2}_${TS}.log"
-
-    echo "启动实例 A: 端口 $PORT1, GPU $DUAL_GPU_A"
-    CUDA_VISIBLE_DEVICES="$DUAL_GPU_A" run_comfy --listen "$LISTEN_ADDR" --port "$PORT1" > "$LOG1" 2>&1 &
-    echo "启动实例 B: 端口 $PORT2, GPU $DUAL_GPU_B"
-    CUDA_VISIBLE_DEVICES="$DUAL_GPU_B" run_comfy --listen "$LISTEN_ADDR" --port "$PORT2" > "$LOG2" 2>&1 &
-    echo ""
-    echo "双卡模式服务已启动，请保持此窗口打开。"
-    echo "实例 A: http://$LISTEN_ADDR:$PORT1 (GPU $DUAL_GPU_A)"
-    echo "实例 B: http://$LISTEN_ADDR:$PORT2 (GPU $DUAL_GPU_B)"
-    echo "日志 A: $LOG1"
-    echo "日志 B: $LOG2"
-    echo "实时日志: tail -f \"$LOG1\" \"$LOG2\""
-    wait
+    RUN_SUMMARY_MODE="dual"
+    start_two_instance_mode "dual" "$DUAL_GPU_A" "$DUAL_GPU_B"
 else
+    RUN_SUMMARY_MODE="normal"
     if [ "$USE_CPU" = "1" ]; then
         echo "使用 CPU 模式"
+        RUN_SUMMARY_LINES=("端口 ${BASE_PORT} -> CPU | 日志: 当前终端标准输出")
+        write_run_summary_file
         unset CUDA_VISIBLE_DEVICES
         run_comfy --cpu --listen "$LISTEN_ADDR" --port "$BASE_PORT"
     elif [ "$GPU_CHOICE" = "2" ]; then
         echo "使用所有GPU设备"
+        RUN_SUMMARY_LINES=("端口 ${BASE_PORT} -> ALL_GPU | 日志: 当前终端标准输出")
+        write_run_summary_file
         run_comfy --listen "$LISTEN_ADDR" --port "$BASE_PORT"
     else
         echo "使用单卡: $GPU_CHOICE"
+        RUN_SUMMARY_LINES=("端口 ${BASE_PORT} -> GPU ${GPU_CHOICE} | 日志: 当前终端标准输出")
+        write_run_summary_file
         export CUDA_VISIBLE_DEVICES="$GPU_CHOICE"
         run_comfy --listen "$LISTEN_ADDR" --port "$BASE_PORT"
     fi
