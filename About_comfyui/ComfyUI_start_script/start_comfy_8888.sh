@@ -1,4 +1,21 @@
 #!/bin/bash
+#
+# ComfyUI 启动脚本（支持交互与非交互）
+#
+# 主要启动方式：
+# 1) 交互模式（默认）：运行后按提示配置端口与设备
+#    bash start_comfy_8888.sh
+#
+# 2) 非交互布局模式（适合守护进程/自动化）
+#    --layout 格式："<端口>:<设备>,<端口>:<设备>,..."
+#    设备可选：0/1（单卡）、2 或 all（全部GPU）、3 或 cpu（CPU）
+#    示例：
+#    bash start_comfy_8888.sh --layout "8888:0,8889:1"
+#    bash start_comfy_8888.sh --layout "8888:all,8890:cpu"
+#
+# 说明：
+# - --layout 下不会进入交互提问，会按配置直接启动。
+# - 可与 --listen 一起使用（例如 --listen 0.0.0.0）。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMFY_DIR="${COMFY_DIR:-$SCRIPT_DIR}"
@@ -11,6 +28,7 @@ GPU_CHOICE=""
 RUN_MODE="normal"
 INTERACTIVE_GPU=1
 INTERACTIVE_TURBO=1
+CUSTOM_LAYOUT=0
 HTTP_PROXY_ADDR="http://127.0.0.1:7890"
 HTTPS_PROXY_ADDR="http://127.0.0.1:7890"
 NO_PROXY_ADDR="localhost,127.0.0.1,192.168.0.0/16"
@@ -71,6 +89,7 @@ usage() {
     echo "  comfyui --dual"
     echo "  comfyui --gpu all"
     echo "  comfyui --all"
+    echo "  comfyui --layout \"8888:0,8889:1\""
     echo "  comfyui --port 8888 --listen 0.0.0.0"
 }
 
@@ -105,7 +124,7 @@ resolve_ports() {
 
         local killed=0
         if [ -t 0 ]; then
-            echo "⚠️  端口占用: $conflict_ports"
+            echo "WARN: 端口占用: $conflict_ports"
             local pids=""
             for p in $conflict_ports; do
                 local this_pids
@@ -129,7 +148,7 @@ resolve_ports() {
                 elif [ -z "$kill_choice" ] || [ "$kill_choice" = "2" ]; then
                     :
                 else
-                    echo "⚠️  输入无效：$kill_choice，按默认值 2 处理（自动换端口）"
+                    echo "WARN: 输入无效：$kill_choice，按默认值 2 处理（自动换端口）"
                 fi
             fi
         fi
@@ -140,8 +159,149 @@ resolve_ports() {
     done
 
     if [ "$ORIGIN_PORT" != "$BASE_PORT" ]; then
-        echo "⚠️  端口被占用，自动切换到 $BASE_PORT"
+        echo "WARN: 端口被占用，自动切换到 $BASE_PORT"
     fi
+}
+
+resolve_single_port() {
+    local target_port="$1"
+    while port_in_use "$target_port"; do
+        local killed=0
+        echo "WARN: 端口占用: $target_port" >&2
+        local pids
+        pids="$(list_port_pids "$target_port" | xargs 2>/dev/null)"
+        if [ -n "$pids" ]; then
+            for pid in $pids; do
+                ps -p "$pid" -o pid=,cmd= 2>/dev/null >&2
+            done
+            if [ -t 0 ]; then
+                echo " [1]   终止占用进程并继续使用当前端口" >&2
+                echo " [2]   不终止，自动尝试下一个端口 (默认)" >&2
+                read -p "请输入选项 (1/2) [默认 2]: " kill_choice
+                if [ "$kill_choice" = "1" ]; then
+                    kill $pids 2>/dev/null
+                    sleep 1
+                    killed=1
+                fi
+            fi
+        fi
+        if [ "$killed" = "0" ]; then
+            target_port=$((target_port+1))
+            echo "WARN: 自动尝试端口: $target_port" >&2
+        fi
+    done
+    echo "$target_port"
+}
+
+prompt_instance_layout() {
+    local default_port="$BASE_PORT"
+    local input_port=""
+    local input_gpu=""
+    INSTANCE_PORTS=()
+    INSTANCE_GPUS=()
+
+    while true; do
+        echo ""
+        read -p "请输入要启动的端口 [默认 ${default_port}]: " input_port
+        [ -z "$input_port" ] && input_port="$default_port"
+
+        if ! [[ "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+            echo "ERROR: 端口无效：$input_port（范围 1-65535）"
+            continue
+        fi
+
+        if [[ " ${INSTANCE_PORTS[*]} " == *" ${input_port} "* ]]; then
+            echo "ERROR: 端口重复：$input_port，请重新输入"
+            continue
+        fi
+
+        echo "为端口 $input_port 选择设备："
+        echo " [0]   GPU 0"
+        echo " [1]   GPU 1"
+        echo " [2]   所有 GPU"
+        echo " [3]   CPU 模式"
+        read -p "请输入选项 (0/1/2/3) [默认 0]: " input_gpu
+        [ -z "$input_gpu" ] && input_gpu="0"
+        input_gpu="$(normalize_gpu_choice "$input_gpu")"
+
+        if [ "$input_gpu" != "0" ] && [ "$input_gpu" != "1" ] && [ "$input_gpu" != "2" ] && [ "$input_gpu" != "3" ]; then
+            echo "ERROR: 输入无效：$input_gpu，请输入 0/1/2/3"
+            continue
+        fi
+
+        INSTANCE_PORTS+=("$input_port")
+        INSTANCE_GPUS+=("$input_gpu")
+        default_port=$((input_port+1))
+
+        while true; do
+            echo "是否继续添加下一个端口实例："
+            echo " [0] 不继续（默认）"
+            echo " [1] 继续添加"
+            read -p "请输入选项 (0/1) [默认 0]: " add_more
+            [ -z "$add_more" ] && add_more="0"
+            if [ "$add_more" = "1" ]; then
+                break
+            elif [ "$add_more" = "0" ]; then
+                break 2
+            else
+                echo "WARN: 输入无效：$add_more，请输入 0 或 1"
+            fi
+        done
+    done
+
+    CUSTOM_LAYOUT=1
+    RUN_MODE="custom"
+}
+
+parse_layout_spec() {
+    local raw_spec="$1"
+    local cleaned_spec="${raw_spec// /}"
+    local entry=""
+    local port=""
+    local gpu=""
+
+    if [ -z "$cleaned_spec" ]; then
+        echo "ERROR: --layout 不能为空"
+        exit 1
+    fi
+
+    INSTANCE_PORTS=()
+    INSTANCE_GPUS=()
+
+    IFS=',' read -r -a layout_entries <<< "$cleaned_spec"
+    for entry in "${layout_entries[@]}"; do
+        if [ -z "$entry" ] || [[ "$entry" != *:* ]]; then
+            echo "ERROR: --layout 条目格式错误：$entry（应为 端口:设备）"
+            exit 1
+        fi
+
+        port="${entry%%:*}"
+        gpu="${entry#*:}"
+        gpu="$(normalize_gpu_choice "$gpu")"
+
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "ERROR: --layout 端口无效：$port（范围 1-65535）"
+            exit 1
+        fi
+
+        if [ "$gpu" != "0" ] && [ "$gpu" != "1" ] && [ "$gpu" != "2" ] && [ "$gpu" != "3" ]; then
+            echo "ERROR: --layout 设备无效：$gpu（可用 0/1/2/3 或 all/cpu）"
+            exit 1
+        fi
+
+        if [[ " ${INSTANCE_PORTS[*]} " == *" ${port} "* ]]; then
+            echo "ERROR: --layout 中端口重复：$port"
+            exit 1
+        fi
+
+        INSTANCE_PORTS+=("$port")
+        INSTANCE_GPUS+=("$gpu")
+    done
+
+    CUSTOM_LAYOUT=1
+    RUN_MODE="custom"
+    INTERACTIVE_GPU=0
+    INTERACTIVE_TURBO=0
 }
 
 while [ $# -gt 0 ]; do
@@ -159,7 +319,7 @@ while [ $# -gt 0 ]; do
             ;;
         --gpu)
             if [ -z "$2" ]; then
-                echo "❌ 错误：--gpu 需要参数"
+                echo "ERROR: --gpu 需要参数"
                 exit 1
             fi
             GPU_CHOICE="$(normalize_gpu_choice "$2")"
@@ -186,7 +346,7 @@ while [ $# -gt 0 ]; do
             ;;
         --port)
             if [ -z "$2" ]; then
-                echo "❌ 错误：--port 需要参数"
+                echo "ERROR: --port 需要参数"
                 exit 1
             fi
             BASE_PORT="$2"
@@ -194,10 +354,18 @@ while [ $# -gt 0 ]; do
             ;;
         --listen)
             if [ -z "$2" ]; then
-                echo "❌ 错误：--listen 需要参数"
+                echo "ERROR: --listen 需要参数"
                 exit 1
             fi
             LISTEN_ADDR="$2"
+            shift 2
+            ;;
+        --layout)
+            if [ -z "$2" ]; then
+                echo "ERROR: --layout 需要参数，例如: --layout \"8888:0,8889:1\""
+                exit 1
+            fi
+            parse_layout_spec "$2"
             shift 2
             ;;
         -h|--help)
@@ -205,7 +373,7 @@ while [ $# -gt 0 ]; do
             exit 0
             ;;
         *)
-            echo "❌ 未知参数: $1"
+            echo "ERROR: 未知参数: $1"
             usage
             exit 1
             ;;
@@ -213,7 +381,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$CONDA_DEFAULT_ENV" ] || [ "$CONDA_DEFAULT_ENV" != "GAOSHIQING" ]; then
-    echo "⚠️  警告：未激活 GAOSHIQING 环境，尝试自动激活..."
+    echo "WARN: 未激活 GAOSHIQING 环境，尝试自动激活..."
 
     if ! command -v conda >/dev/null 2>&1; then
         if [ -f "/home/qc/anaconda3/etc/profile.d/conda.sh" ]; then
@@ -230,22 +398,19 @@ if [ -z "$CONDA_DEFAULT_ENV" ] || [ "$CONDA_DEFAULT_ENV" != "GAOSHIQING" ]; then
     if command -v conda >/dev/null 2>&1; then
         eval "$(conda shell.bash hook 2>/dev/null)"
         if conda activate GAOSHIQING >/dev/null 2>&1; then
-            echo "✅ 环境已激活: $CONDA_DEFAULT_ENV"
+            echo "INFO: 环境已激活: $CONDA_DEFAULT_ENV"
         else
-            echo "⚠️  conda activate 失败，改用 conda run 启动"
+            echo "WARN: conda activate 失败，改用 conda run 启动"
             USE_CONDA_RUN=1
         fi
     else
-        echo "❌ 错误：未找到 conda，无法启动 GAOSHIQING 环境"
+        echo "ERROR: 未找到 conda，无法启动 GAOSHIQING 环境"
         exit 1
     fi
 fi
 
 run_comfy() {
     local args=("$@")
-    if [ "$USE_CPU" = "1" ]; then
-        args=(--cpu "${args[@]}")
-    fi
     if [ "$USE_CONDA_RUN" = "1" ]; then
         CONDA_NO_PLUGINS=true conda run -n GAOSHIQING python "$COMFY_MAIN" "${args[@]}"
     else
@@ -254,7 +419,7 @@ run_comfy() {
 }
 
 if [ ! -d "$COMFY_DIR" ]; then
-    echo "❌ 错误：找不到目录 $COMFY_DIR"
+    echo "ERROR: 找不到目录 $COMFY_DIR"
     exit 1
 fi
 cd "$COMFY_DIR" || exit
@@ -275,83 +440,90 @@ echo "=== GPU 状态 ==="
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
 echo "--------------------------------"
 
-if [ "$INTERACTIVE_GPU" = "1" ]; then
-    echo "请选择要使用的 GPU 设备："
-    echo " [0]   使用 0 号显卡 (推荐)"
-    echo " [1]   使用 1 号显卡"
-    echo " [2]   使用所有显卡"
-    echo " [3]   CPU 模式"
-    read -p "请输入选项 (0/1/2/3) [默认 0]: " GPU_CHOICE
-    [ -z "$GPU_CHOICE" ] && GPU_CHOICE="0"
-fi
+if [ "$INTERACTIVE_GPU" = "1" ] && [ "$INTERACTIVE_TURBO" = "1" ] && [ "$RUN_MODE" = "normal" ]; then
+    echo "请选择启动实例布局（端口 + 设备）"
+    prompt_instance_layout
+else
+    if [ "$INTERACTIVE_GPU" = "1" ]; then
+        echo "请选择要使用的 GPU 设备："
+        echo " [0]   使用 0 号显卡 (推荐)"
+        echo " [1]   使用 1 号显卡"
+        echo " [2]   使用所有显卡"
+        echo " [3]   CPU 模式"
+        read -p "请输入选项 (0/1/2/3) [默认 0]: " GPU_CHOICE
+        [ -z "$GPU_CHOICE" ] && GPU_CHOICE="0"
+    fi
 
-GPU_CHOICE="$(normalize_gpu_choice "$GPU_CHOICE")"
-if [ "$GPU_CHOICE" = "3" ]; then
-    USE_CPU=1
-fi
+    GPU_CHOICE="$(normalize_gpu_choice "$GPU_CHOICE")"
+    if [ "$GPU_CHOICE" = "3" ]; then
+        USE_CPU=1
+    fi
 
-if [ "$GPU_CHOICE" != "0" ] && [ "$GPU_CHOICE" != "1" ] && [ "$GPU_CHOICE" != "2" ] && [ "$GPU_CHOICE" != "3" ]; then
-    echo "❌ 输入无效：$GPU_CHOICE"
-    echo "   请输入 0/1/2/3"
-    exit 1
-fi
+    if [ "$GPU_CHOICE" != "0" ] && [ "$GPU_CHOICE" != "1" ] && [ "$GPU_CHOICE" != "2" ] && [ "$GPU_CHOICE" != "3" ]; then
+    echo "ERROR: 输入无效：$GPU_CHOICE"
+        echo "   请输入 0/1/2/3"
+        exit 1
+    fi
 
-if [ "$USE_CPU" = "1" ]; then
-    RUN_MODE="normal"
-elif [ "$RUN_MODE" = "dual" ]; then
-    :
-elif [ "$INTERACTIVE_TURBO" = "1" ]; then
-    echo ""
-    if [ "$GPU_CHOICE" = "2" ]; then
-        echo "是否开启双卡模式 (Dual)?"
-        echo "   - 实例 A 绑定 GPU $DUAL_GPU_A"
-        echo "   - 实例 B 绑定 GPU $DUAL_GPU_B"
-        echo "   - 端口：$BASE_PORT 和 $((BASE_PORT+1))"
-        echo " [1]   开启双卡模式"
-        echo " [2]   不开启，使用普通模式 (默认)"
-        read -p "请输入选项 (1/2) [默认 2]: " dual_choice
-        if [ "$dual_choice" = "1" ]; then
-            RUN_MODE="dual"
-        elif [ -z "$dual_choice" ] || [ "$dual_choice" = "2" ]; then
-            RUN_MODE="normal"
+    if [ "$USE_CPU" = "1" ]; then
+        RUN_MODE="normal"
+    elif [ "$RUN_MODE" = "dual" ]; then
+        :
+    elif [ "$INTERACTIVE_TURBO" = "1" ]; then
+        echo ""
+        if [ "$GPU_CHOICE" = "2" ]; then
+            echo "是否开启双卡模式 (Dual)?"
+            echo "   - 实例 A 绑定 GPU $DUAL_GPU_A"
+            echo "   - 实例 B 绑定 GPU $DUAL_GPU_B"
+            echo "   - 端口：$BASE_PORT 和 $((BASE_PORT+1))"
+            echo " [1]   开启双卡模式"
+            echo " [2]   不开启，使用普通模式 (默认)"
+            read -p "请输入选项 (1/2) [默认 2]: " dual_choice
+            if [ "$dual_choice" = "1" ]; then
+                RUN_MODE="dual"
+            elif [ -z "$dual_choice" ] || [ "$dual_choice" = "2" ]; then
+                RUN_MODE="normal"
+            else
+                echo "WARN: 输入无效：$dual_choice，按默认值 2 处理（普通模式）"
+                RUN_MODE="normal"
+            fi
         else
-            echo "⚠️  输入无效：$dual_choice，按默认值 2 处理（普通模式）"
-            RUN_MODE="normal"
-        fi
-    else
-        echo "是否开启 Turbo 模式（双实例分卡）?"
-        echo "   - 实例 A 使用当前选择的 GPU"
-        echo "   - 实例 B 自动使用另一张 GPU"
-        echo "   - 端口：$BASE_PORT 和 $((BASE_PORT+1))"
-        echo " [1]   开启 Turbo 模式"
-        echo " [2]   不开启，使用普通模式 (默认)"
-        read -p "请输入选项 (1/2) [默认 2]: " turbo_choice
-        if [ "$turbo_choice" = "1" ]; then
-            RUN_MODE="turbo"
-        elif [ -z "$turbo_choice" ] || [ "$turbo_choice" = "2" ]; then
-            RUN_MODE="normal"
-        else
-            echo "⚠️  输入无效：$turbo_choice，按默认值 2 处理（普通模式）"
-            RUN_MODE="normal"
+            echo "请选择运行模式："
+            echo " [1]   单实例模式 (默认)"
+            echo "       - 使用 GPU $GPU_CHOICE"
+            echo "       - 端口：$BASE_PORT"
+            echo " [2]   Turbo 双实例分卡"
+            echo "       - 实例 A 使用 GPU $GPU_CHOICE"
+            echo "       - 实例 B 自动使用另一张 GPU"
+            echo "       - 端口：$BASE_PORT 和 $((BASE_PORT+1))"
+            read -p "请输入选项 (1/2) [默认 1]: " mode_choice
+            if [ -z "$mode_choice" ] || [ "$mode_choice" = "1" ]; then
+                RUN_MODE="normal"
+            elif [ "$mode_choice" = "2" ]; then
+                RUN_MODE="turbo"
+            else
+                echo "WARN: 输入无效：$mode_choice，按默认值 1 处理（单实例）"
+                RUN_MODE="normal"
+            fi
         fi
     fi
 fi
 
 if [ "$RUN_MODE" = "dual" ] && [ "$GPU_CHOICE" != "2" ]; then
-    echo "❌ 错误：双卡并发模式要求 GPU 选择为 all"
+    echo "ERROR: 双卡并发模式要求 GPU 选择为 all"
     echo "   请使用 --gpu all --dual，或在交互中选择 [2] 使用所有显卡"
     exit 1
 fi
 
 if [ "$RUN_MODE" = "turbo" ] && [ "$GPU_CHOICE" = "2" ]; then
-    echo "❌ 错误：Turbo 模式需要指定单卡（0 或 1）作为实例 A 的显卡"
+    echo "ERROR: Turbo 模式需要指定单卡（0 或 1）作为实例 A 的显卡"
     exit 1
 fi
 
 if [ "$RUN_MODE" = "dual" ] || [ "$RUN_MODE" = "turbo" ]; then
     GPU_COUNT="$(nvidia-smi --list-gpus 2>/dev/null | wc -l)"
     if [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -lt 2 ]; then
-        echo "❌ 错误：当前模式至少需要 2 张可用 GPU"
+        echo "ERROR: 当前模式至少需要 2 张可用 GPU"
         exit 1
     fi
 fi
@@ -365,7 +537,25 @@ if [ "$RUN_MODE" = "turbo" ]; then
     fi
 fi
 
-resolve_ports
+if [ "$RUN_MODE" = "custom" ]; then
+    RESOLVED_INSTANCE_PORTS=()
+    RESOLVED_INSTANCE_GPUS=()
+    for idx in "${!INSTANCE_PORTS[@]}"; do
+        local_port="${INSTANCE_PORTS[$idx]}"
+        local_gpu="${INSTANCE_GPUS[$idx]}"
+        resolved_port="$(resolve_single_port "$local_port")"
+        while [[ " ${RESOLVED_INSTANCE_PORTS[*]} " == *" ${resolved_port} "* ]]; do
+            resolved_port=$((resolved_port+1))
+            resolved_port="$(resolve_single_port "$resolved_port")"
+        done
+        RESOLVED_INSTANCE_PORTS+=("$resolved_port")
+        RESOLVED_INSTANCE_GPUS+=("$local_gpu")
+    done
+    INSTANCE_PORTS=("${RESOLVED_INSTANCE_PORTS[@]}")
+    INSTANCE_GPUS=("${RESOLVED_INSTANCE_GPUS[@]}")
+else
+    resolve_ports
+fi
 
 cleanup() {
     echo ""
@@ -379,13 +569,28 @@ trap cleanup SIGINT SIGTERM
 echo ""
 echo "================ 启动信息 ================"
 echo "目录: $COMFY_DIR"
-if [ "$USE_CPU" = "1" ]; then
+if [ "$RUN_MODE" = "custom" ]; then
+    echo "模式: 自定义多端口"
+    for idx in "${!INSTANCE_PORTS[@]}"; do
+        device_label="${INSTANCE_GPUS[$idx]}"
+        if [ "$device_label" = "3" ]; then
+            device_label="CPU"
+        elif [ "$device_label" = "2" ]; then
+            device_label="ALL_GPU"
+        else
+            device_label="GPU ${device_label}"
+        fi
+        echo "实例 $((idx+1)): http://$LISTEN_ADDR:${INSTANCE_PORTS[$idx]} -> ${device_label}"
+    done
+elif [ "$USE_CPU" = "1" ]; then
     echo "设备: CPU"
 else
     echo "设备: $GPU_CHOICE"
 fi
-echo "模式: $RUN_MODE"
-echo "地址: http://$LISTEN_ADDR:$BASE_PORT"
+if [ "$RUN_MODE" != "custom" ]; then
+    echo "模式: $RUN_MODE"
+    echo "地址: http://$LISTEN_ADDR:$BASE_PORT"
+fi
 if [ "$RUN_MODE" = "turbo" ]; then
     echo "Turbo 映射: 实例A -> GPU $TURBO_GPU_A, 实例B -> GPU $TURBO_GPU_B"
 elif [ "$RUN_MODE" = "dual" ]; then
@@ -396,7 +601,67 @@ echo "HTTPS_PROXY: $HTTPS_PROXY"
 echo "NO_PROXY: $NO_PROXY"
 echo "=========================================="
 
-if [ "$RUN_MODE" == "turbo" ]; then
+if [ -t 0 ]; then
+    echo ""
+    echo "请确认将要启动的实例："
+    if [ "$RUN_MODE" = "custom" ]; then
+        for idx in "${!INSTANCE_PORTS[@]}"; do
+            device_label="${INSTANCE_GPUS[$idx]}"
+            if [ "$device_label" = "3" ]; then
+                device_label="CPU"
+            elif [ "$device_label" = "2" ]; then
+                device_label="ALL_GPU"
+            else
+                device_label="GPU ${device_label}"
+            fi
+            echo " - 端口 ${INSTANCE_PORTS[$idx]} -> ${device_label}"
+        done
+    elif [ "$RUN_MODE" = "turbo" ]; then
+        echo " - 端口 $BASE_PORT -> GPU $TURBO_GPU_A"
+        echo " - 端口 $((BASE_PORT+1)) -> GPU $TURBO_GPU_B"
+    elif [ "$RUN_MODE" = "dual" ]; then
+        echo " - 端口 $BASE_PORT -> GPU $DUAL_GPU_A"
+        echo " - 端口 $((BASE_PORT+1)) -> GPU $DUAL_GPU_B"
+    elif [ "$USE_CPU" = "1" ]; then
+        echo " - 端口 $BASE_PORT -> CPU"
+    elif [ "$GPU_CHOICE" = "2" ]; then
+        echo " - 端口 $BASE_PORT -> ALL_GPU"
+    else
+        echo " - 端口 $BASE_PORT -> GPU $GPU_CHOICE"
+    fi
+    read -p "确认启动以上实例? (y/N): " start_confirm
+    if [ "$start_confirm" != "y" ] && [ "$start_confirm" != "Y" ]; then
+        echo "已取消启动。"
+        exit 0
+    fi
+fi
+
+if [ "$RUN_MODE" == "custom" ]; then
+    TS="$(date +%Y%m%d_%H%M%S)"
+    echo "按自定义布局启动实例..."
+    for idx in "${!INSTANCE_PORTS[@]}"; do
+        port="${INSTANCE_PORTS[$idx]}"
+        gpu="${INSTANCE_GPUS[$idx]}"
+        log_file="$COMFY_DIR/logs/comfyui_${port}_${TS}.log"
+        if [ "$gpu" = "3" ]; then
+            echo "启动实例 $((idx+1)): 端口 $port, CPU"
+            unset CUDA_VISIBLE_DEVICES
+            run_comfy --cpu --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+        elif [ "$gpu" = "2" ]; then
+            echo "启动实例 $((idx+1)): 端口 $port, 所有 GPU"
+            unset CUDA_VISIBLE_DEVICES
+            run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+        else
+            echo "启动实例 $((idx+1)): 端口 $port, GPU $gpu"
+            CUDA_VISIBLE_DEVICES="$gpu" run_comfy --listen "$LISTEN_ADDR" --port "$port" > "$log_file" 2>&1 &
+        fi
+        echo "日志: $log_file"
+    done
+    echo ""
+    echo "服务已启动，请保持此窗口打开。"
+    echo "实时日志: tail -f \"$COMFY_DIR\"/logs/comfyui_*.log"
+    wait
+elif [ "$RUN_MODE" == "turbo" ]; then
     PORT1=$BASE_PORT
     PORT2=$((BASE_PORT+1))
     TS="$(date +%Y%m%d_%H%M%S)"
@@ -413,6 +678,7 @@ if [ "$RUN_MODE" == "turbo" ]; then
     echo "实例 B: http://$LISTEN_ADDR:$PORT2"
     echo "日志 A: $LOG1"
     echo "日志 B: $LOG2"
+    echo "实时日志: tail -f \"$LOG1\" \"$LOG2\""
     wait
 elif [ "$RUN_MODE" == "dual" ]; then
     PORT1=$BASE_PORT
@@ -431,12 +697,13 @@ elif [ "$RUN_MODE" == "dual" ]; then
     echo "实例 B: http://$LISTEN_ADDR:$PORT2 (GPU $DUAL_GPU_B)"
     echo "日志 A: $LOG1"
     echo "日志 B: $LOG2"
+    echo "实时日志: tail -f \"$LOG1\" \"$LOG2\""
     wait
 else
     if [ "$USE_CPU" = "1" ]; then
         echo "使用 CPU 模式"
         unset CUDA_VISIBLE_DEVICES
-        run_comfy --listen "$LISTEN_ADDR" --port "$BASE_PORT"
+        run_comfy --cpu --listen "$LISTEN_ADDR" --port "$BASE_PORT"
     elif [ "$GPU_CHOICE" = "2" ]; then
         echo "使用所有GPU设备"
         run_comfy --listen "$LISTEN_ADDR" --port "$BASE_PORT"
