@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMFY_START_SCRIPT="$SCRIPT_DIR/start_comfy_8888.sh"
+
+COMFY_LAYOUT="${COMFY_LAYOUT:-8888:0,8889:1}"
+COMFY_ENABLE_VRAM_LIMIT="${COMFY_ENABLE_VRAM_LIMIT:-1}"
+COMFY_VRAM_RESERVE="${COMFY_VRAM_RESERVE:-2048}"
+AUTO_KILL_PORT_OCCUPIERS="${AUTO_KILL_PORT_OCCUPIERS:-0}"
+
+args=(--layout "$COMFY_LAYOUT" --vram-reserve "$COMFY_VRAM_RESERVE")
+if [[ "$COMFY_ENABLE_VRAM_LIMIT" == "1" ]]; then
+  args+=(--vram-limit)
+fi
+
+AUTO_KILL_PORT_OCCUPIERS="$AUTO_KILL_PORT_OCCUPIERS" exec "$COMFY_START_SCRIPT" "${args[@]}"
