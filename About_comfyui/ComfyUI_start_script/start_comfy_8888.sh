@@ -12,6 +12,8 @@
 #    示例：
 #    bash start_comfy_8888.sh --layout "8888:0,8889:1"
 #    bash start_comfy_8888.sh --layout "8888:all,8890:cpu"
+#    bash start_comfy_8888.sh --gpu 0 --ports "8888,8889"
+#    bash start_comfy_8888.sh --gpu 0 --ports "8888,8889" --vram-limit --vram-per-instance 10000
 #
 # 说明：
 # - --layout 下不会进入交互提问，会按配置直接启动。
@@ -29,6 +31,18 @@ RUN_MODE="normal"
 INTERACTIVE_GPU=1
 INTERACTIVE_TURBO=1
 CUSTOM_LAYOUT=0
+CUSTOM_PORTS_SPEC=""
+
+# ================= 显存限制开关（按需手改） =================
+# 1 = 开启：启动前按“单卡每实例预算”做显存校验，不满足则阻止启动
+# 0 = 关闭：不做该校验
+ENABLE_SINGLE_GPU_VRAM_LIMIT=0
+# 单卡每个实例预算显存（MiB），留空表示自动均分（按当前空闲显存计算）
+SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB=""
+# 每张卡额外预留显存（MiB），避免刚好卡边界导致 OOM
+SINGLE_GPU_VRAM_SAFETY_MB=2048
+# ==========================================================
+
 HTTP_PROXY_ADDR="http://127.0.0.1:7890"
 HTTPS_PROXY_ADDR="http://127.0.0.1:7890"
 NO_PROXY_ADDR="localhost,127.0.0.1,192.168.0.0/16"
@@ -95,6 +109,8 @@ usage() {
     echo "  comfyui --gpu all"
     echo "  comfyui --all"
     echo "  comfyui --layout \"8888:0,8889:1\""
+    echo "  comfyui --gpu 0 --ports \"8888,8889\""
+    echo "  comfyui --gpu 0 --ports \"8888,8889\" --vram-limit --vram-per-instance 10000 --vram-reserve 2048"
     echo "  comfyui --port 8888 --listen 0.0.0.0"
 }
 
@@ -309,6 +325,46 @@ parse_layout_spec() {
     INTERACTIVE_TURBO=0
 }
 
+parse_ports_spec_with_device() {
+    local raw_ports="$1"
+    local gpu="$2"
+    local cleaned_ports="${raw_ports// /}"
+    local port=""
+
+    if [ -z "$cleaned_ports" ]; then
+        echo "ERROR: --ports 不能为空"
+        exit 1
+    fi
+
+    if [ "$gpu" != "0" ] && [ "$gpu" != "1" ] && [ "$gpu" != "2" ] && [ "$gpu" != "3" ]; then
+        echo "ERROR: --ports 需要有效设备（0/1/2/3），请先通过 --gpu/--all/--cpu 指定设备"
+        exit 1
+    fi
+
+    INSTANCE_PORTS=()
+    INSTANCE_GPUS=()
+    IFS=',' read -r -a ports_entries <<< "$cleaned_ports"
+    for port in "${ports_entries[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "ERROR: --ports 端口无效：$port（范围 1-65535）"
+            exit 1
+        fi
+
+        if [[ " ${INSTANCE_PORTS[*]} " == *" ${port} "* ]]; then
+            echo "ERROR: --ports 中端口重复：$port"
+            exit 1
+        fi
+
+        INSTANCE_PORTS+=("$port")
+        INSTANCE_GPUS+=("$gpu")
+    done
+
+    CUSTOM_LAYOUT=1
+    RUN_MODE="custom"
+    INTERACTIVE_GPU=0
+    INTERACTIVE_TURBO=0
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --cpu)
@@ -373,6 +429,38 @@ while [ $# -gt 0 ]; do
             parse_layout_spec "$2"
             shift 2
             ;;
+        --ports)
+            if [ -z "$2" ]; then
+                echo "ERROR: --ports 需要参数，例如: --ports \"8888,8889\""
+                exit 1
+            fi
+            CUSTOM_PORTS_SPEC="$2"
+            shift 2
+            ;;
+        --vram-limit)
+            ENABLE_SINGLE_GPU_VRAM_LIMIT=1
+            shift
+            ;;
+        --no-vram-limit)
+            ENABLE_SINGLE_GPU_VRAM_LIMIT=0
+            shift
+            ;;
+        --vram-per-instance)
+            if [ -z "$2" ]; then
+                echo "ERROR: --vram-per-instance 需要参数（正整数 MiB）"
+                exit 1
+            fi
+            SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB="$2"
+            shift 2
+            ;;
+        --vram-reserve)
+            if [ -z "$2" ]; then
+                echo "ERROR: --vram-reserve 需要参数（非负整数 MiB）"
+                exit 1
+            fi
+            SINGLE_GPU_VRAM_SAFETY_MB="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -384,6 +472,20 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -n "$CUSTOM_PORTS_SPEC" ]; then
+    if [ "$CUSTOM_LAYOUT" = "1" ]; then
+        echo "ERROR: --ports 与 --layout 不能同时使用"
+        exit 1
+    fi
+
+    GPU_CHOICE="$(normalize_gpu_choice "$GPU_CHOICE")"
+    if [ -z "$GPU_CHOICE" ]; then
+        GPU_CHOICE="0"
+    fi
+    [ "$GPU_CHOICE" = "3" ] && USE_CPU=1
+    parse_ports_spec_with_device "$CUSTOM_PORTS_SPEC" "$GPU_CHOICE"
+fi
 
 if [ -z "$CONDA_DEFAULT_ENV" ] || [ "$CONDA_DEFAULT_ENV" != "GAOSHIQING" ]; then
     echo "WARN: 未激活 GAOSHIQING 环境，尝试自动激活..."
@@ -468,6 +570,131 @@ append_run_summary_line() {
     local label
     label="$(device_label_from_choice "$gpu")"
     RUN_SUMMARY_LINES+=("端口 ${port} -> ${label} | 日志: ${log_file}")
+}
+
+query_gpu_free_mem_mb() {
+    local gpu_index="$1"
+    nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null | awk 'NR==1{print $1}'
+}
+
+check_single_gpu_vram_limit() {
+    [ "$ENABLE_SINGLE_GPU_VRAM_LIMIT" = "1" ] || return 0
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "WARN: 已开启显存限制校验，但未找到 nvidia-smi，跳过校验"
+        return 0
+    fi
+
+    if [ -n "$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB" ]; then
+        if ! [[ "$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB" =~ ^[0-9]+$ ]] || [ "$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB" -le 0 ]; then
+            echo "ERROR: SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB 必须是正整数（MiB）或留空自动均分"
+            exit 1
+        fi
+    fi
+    if ! [[ "$SINGLE_GPU_VRAM_SAFETY_MB" =~ ^[0-9]+$ ]] || [ "$SINGLE_GPU_VRAM_SAFETY_MB" -lt 0 ]; then
+        echo "ERROR: SINGLE_GPU_VRAM_SAFETY_MB 必须是非负整数（MiB）"
+        exit 1
+    fi
+
+    local gpu0_count=0
+    local gpu1_count=0
+    local idx
+    local local_gpu
+    local free_mem
+    local required_mem
+    local per_instance_budget
+
+    if [ "$RUN_MODE" = "custom" ]; then
+        for idx in "${!INSTANCE_GPUS[@]}"; do
+            local_gpu="${INSTANCE_GPUS[$idx]}"
+            if [ "$local_gpu" = "0" ]; then
+                gpu0_count=$((gpu0_count+1))
+            elif [ "$local_gpu" = "1" ]; then
+                gpu1_count=$((gpu1_count+1))
+            fi
+        done
+    elif [ "$RUN_MODE" = "turbo" ]; then
+        [ "$TURBO_GPU_A" = "0" ] && gpu0_count=$((gpu0_count+1))
+        [ "$TURBO_GPU_A" = "1" ] && gpu1_count=$((gpu1_count+1))
+        [ "$TURBO_GPU_B" = "0" ] && gpu0_count=$((gpu0_count+1))
+        [ "$TURBO_GPU_B" = "1" ] && gpu1_count=$((gpu1_count+1))
+    elif [ "$RUN_MODE" = "dual" ]; then
+        [ "$DUAL_GPU_A" = "0" ] && gpu0_count=$((gpu0_count+1))
+        [ "$DUAL_GPU_A" = "1" ] && gpu1_count=$((gpu1_count+1))
+        [ "$DUAL_GPU_B" = "0" ] && gpu0_count=$((gpu0_count+1))
+        [ "$DUAL_GPU_B" = "1" ] && gpu1_count=$((gpu1_count+1))
+    else
+        if [ "$USE_CPU" != "1" ] && [ "$GPU_CHOICE" != "2" ]; then
+            [ "$GPU_CHOICE" = "0" ] && gpu0_count=1
+            [ "$GPU_CHOICE" = "1" ] && gpu1_count=1
+        fi
+    fi
+
+    if [ "$gpu0_count" -gt 0 ]; then
+        free_mem="$(query_gpu_free_mem_mb 0)"
+        if ! [[ "$free_mem" =~ ^[0-9]+$ ]]; then
+            echo "WARN: 无法读取 GPU 0 空闲显存，跳过 GPU 0 校验"
+        else
+            if [ -n "$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB" ]; then
+                per_instance_budget="$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB"
+            else
+                if [ "$free_mem" -le "$SINGLE_GPU_VRAM_SAFETY_MB" ]; then
+                    echo "ERROR: GPU 0 空闲显存不足以满足安全预留 ${SINGLE_GPU_VRAM_SAFETY_MB} MiB"
+                    echo "       当前空闲: ${free_mem} MiB"
+                    exit 1
+                fi
+                per_instance_budget=$(((free_mem - SINGLE_GPU_VRAM_SAFETY_MB) / gpu0_count))
+                if [ "$per_instance_budget" -le 0 ]; then
+                    echo "ERROR: GPU 0 自动均分后每实例预算 <= 0 MiB，无法启动"
+                    echo "       计划实例数: $gpu0_count, 当前空闲: ${free_mem} MiB, 安全预留: ${SINGLE_GPU_VRAM_SAFETY_MB} MiB"
+                    exit 1
+                fi
+                echo "INFO: GPU 0 未设置每实例预算，自动均分为 ${per_instance_budget} MiB/实例（实例数 ${gpu0_count}）"
+            fi
+            required_mem=$((gpu0_count * per_instance_budget + SINGLE_GPU_VRAM_SAFETY_MB))
+            if [ "$required_mem" -gt "$free_mem" ]; then
+                echo "ERROR: GPU 0 显存不足（已启用限制）"
+                echo "       计划实例数: $gpu0_count"
+                echo "       需要 >= ${required_mem} MiB（每实例 ${per_instance_budget} + 预留 ${SINGLE_GPU_VRAM_SAFETY_MB}）"
+                echo "       当前空闲: ${free_mem} MiB"
+                echo "       可调整脚本常量：ENABLE_SINGLE_GPU_VRAM_LIMIT / SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB / SINGLE_GPU_VRAM_SAFETY_MB"
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ "$gpu1_count" -gt 0 ]; then
+        free_mem="$(query_gpu_free_mem_mb 1)"
+        if ! [[ "$free_mem" =~ ^[0-9]+$ ]]; then
+            echo "WARN: 无法读取 GPU 1 空闲显存，跳过 GPU 1 校验"
+        else
+            if [ -n "$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB" ]; then
+                per_instance_budget="$SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB"
+            else
+                if [ "$free_mem" -le "$SINGLE_GPU_VRAM_SAFETY_MB" ]; then
+                    echo "ERROR: GPU 1 空闲显存不足以满足安全预留 ${SINGLE_GPU_VRAM_SAFETY_MB} MiB"
+                    echo "       当前空闲: ${free_mem} MiB"
+                    exit 1
+                fi
+                per_instance_budget=$(((free_mem - SINGLE_GPU_VRAM_SAFETY_MB) / gpu1_count))
+                if [ "$per_instance_budget" -le 0 ]; then
+                    echo "ERROR: GPU 1 自动均分后每实例预算 <= 0 MiB，无法启动"
+                    echo "       计划实例数: $gpu1_count, 当前空闲: ${free_mem} MiB, 安全预留: ${SINGLE_GPU_VRAM_SAFETY_MB} MiB"
+                    exit 1
+                fi
+                echo "INFO: GPU 1 未设置每实例预算，自动均分为 ${per_instance_budget} MiB/实例（实例数 ${gpu1_count}）"
+            fi
+            required_mem=$((gpu1_count * per_instance_budget + SINGLE_GPU_VRAM_SAFETY_MB))
+            if [ "$required_mem" -gt "$free_mem" ]; then
+                echo "ERROR: GPU 1 显存不足（已启用限制）"
+                echo "       计划实例数: $gpu1_count"
+                echo "       需要 >= ${required_mem} MiB（每实例 ${per_instance_budget} + 预留 ${SINGLE_GPU_VRAM_SAFETY_MB}）"
+                echo "       当前空闲: ${free_mem} MiB"
+                echo "       可调整脚本常量：ENABLE_SINGLE_GPU_VRAM_LIMIT / SINGLE_GPU_INSTANCE_VRAM_LIMIT_MB / SINGLE_GPU_VRAM_SAFETY_MB"
+                exit 1
+            fi
+        fi
+    fi
 }
 
 write_run_summary_file() {
@@ -680,6 +907,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 RUN_SUMMARY_TS_FILE="$(date +%Y%m%d_%H%M%S)"
 RUN_SUMMARY_TS_HUMAN="$(date '+%Y-%m-%d %H:%M:%S')"
+check_single_gpu_vram_limit
 
 echo ""
 echo "================ 启动信息 ================"
